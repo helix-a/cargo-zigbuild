@@ -556,12 +556,7 @@ fn filter_linker_args(
     result
 }
 
-/// Deduplicate `-l` arguments for Apple targets, keeping the first occurrence.
-///
-/// ld64 ignores duplicate libraries, but Zig's Mach-O linker (since 0.14) emits
-/// one `LC_LOAD_DYLIB` load command per `-l` flag, and newer macOS dyld refuses
-/// to load binaries with duplicate linked dylibs.
-/// See https://github.com/rust-cross/cargo-zigbuild/issues/457
+/// Matches ld64's duplicate-library handling; repeated Mach-O load commands prevent launch.
 fn dedup_apple_link_libs(args: Vec<String>) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     args.into_iter()
@@ -2735,32 +2730,63 @@ mod tests {
 
     #[test]
     fn test_dedup_apple_duplicate_libs() {
-        // See https://github.com/rust-cross/cargo-zigbuild/issues/457
-        let darwin = Some("aarch64-apple-darwin");
-        let result = run_filter(
-            &[
-                "-lobjc",
-                "-framework",
-                "AppKit",
-                "-lobjc",
-                "-liconv",
-                "-lobjc",
-                "main.o",
-            ],
-            darwin,
-            (16, 0),
-        );
-        assert_eq!(
-            result,
-            vec!["-lobjc", "-framework", "AppKit", "-liconv", "main.o"]
-        );
-        // duplicates are kept on non-Apple targets where link order can matter
+        for target in ["aarch64-apple-darwin", "x86_64-apple-darwin"] {
+            let result = run_filter(
+                &[
+                    "-lobjc",
+                    "-framework",
+                    "AppKit",
+                    "-lobjc",
+                    "-liconv",
+                    "-lobjc",
+                    "main.o",
+                    "main.o",
+                ],
+                Some(target),
+                (16, 0),
+            );
+            assert_eq!(
+                result,
+                vec![
+                    "-lobjc",
+                    "-framework",
+                    "AppKit",
+                    "-liconv",
+                    "main.o",
+                    "main.o"
+                ]
+            );
+        }
         let result = run_filter(
             &["-lfoo", "-lfoo"],
             Some("x86_64-unknown-linux-gnu"),
             (16, 0),
         );
         assert_eq!(result, vec!["-lfoo", "-lfoo"]);
+    }
+
+    #[test]
+    fn test_dedup_apple_response_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("linker-arguments");
+        let arg = format!("@{}", path.display());
+        let zig = Zig::Cc { args: Vec::new() };
+        for target in ["aarch64-apple-darwin", "x86_64-apple-darwin"] {
+            fs::write(&path, "-lobjc\n-framework\nAppKit\n-lobjc\nmain.o").unwrap();
+            let result = zig
+                .process_linker_response_file(
+                    &arg,
+                    &make_rustc_ver(1, 97, 1),
+                    &make_zig_ver(0, 16, 0),
+                    &TargetInfo::new(Some(&target.to_string())),
+                )
+                .unwrap();
+            assert_eq!(result, arg);
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                "-lobjc\n-framework\nAppKit\nmain.o"
+            );
+        }
     }
 
     #[test]
